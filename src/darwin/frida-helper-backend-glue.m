@@ -1663,12 +1663,14 @@ _frida_darwin_helper_backend_prepare_spawn_instance_for_injection (FridaDarwinHe
   instance->info_address = gum_darwin_module_resolve_symbol_address (dyld, "__ZN4dyld12gProcessInfoE");
   instance->helpers_ptr_address = gum_darwin_module_resolve_symbol_address (dyld, "__ZN4dyld17gLibSystemHelpersE");
   instance->do_modinit_start = gum_darwin_module_resolve_symbol_address (dyld, "__ZN16ImageLoaderMachO18doModInitFunctionsERKN11ImageLoader11LinkContextE");
+  instance->do_modinit_end = gum_darwin_module_resolve_symbol_address (dyld, "__ZN16ImageLoaderMachO16doGetDOFSectionsERKN11ImageLoader11LinkContextERNSt3__16vectorINS0_7DOFInfoENS4_9allocatorIS6_EEEE");
   instance->strcmp_address = gum_darwin_module_resolve_symbol_address (dyld, "_strcmp");
 
   g_object_unref (dyld);
 
   if (legacy_entry_address == 0 || instance->dlopen_address == 0 || instance->register_helpers_address == 0 ||
-      instance->info_address == 0 || instance->do_modinit_start == 0 || instance->strcmp_address == 0)
+      instance->info_address == 0 || instance->do_modinit_start == 0 || instance->do_modinit_end == 0 ||
+      instance->strcmp_address == 0)
   {
     goto dyld_probe_failed;
   }
@@ -1679,10 +1681,6 @@ _frida_darwin_helper_backend_prepare_spawn_instance_for_injection (FridaDarwinHe
     instance->register_helpers_address |= 1;
     instance->do_modinit_start |= 1;
   }
-
-  instance->do_modinit_end = frida_find_function_end (task, instance->cpu_type, instance->do_modinit_start, 1024);
-  if (instance->do_modinit_end == 0)
-    goto dyld_probe_failed;
 
   instance->ret_gadget = frida_find_function_end (task, instance->cpu_type, instance->register_helpers_address, 128);
   if (instance->ret_gadget == 0)
@@ -2459,9 +2457,18 @@ frida_spawn_instance_handle_breakpoint (FridaSpawnInstance * self, FridaBreakpoi
       self->breakpoint_phase = self->need_helpers ? FRIDA_BREAKPOINT_SET_HELPERS : FRIDA_BREAKPOINT_DLOPEN_LIBC;
   }
 
-#ifndef HAVE_I386
-  if (pc == (self->ret_gadget & ~1))
+  if (pc == (self->ret_gadget & ~GUM_ADDRESS (1)))
   {
+#ifdef HAVE_I386
+    if (self->cpu_type == GUM_CPU_AMD64)
+    {
+      state->uts.ts64.__rax = self->fake_error_buf;
+    }
+    else
+    {
+      state->uts.ts32.__eax = self->fake_error_buf;
+    }
+#else
     if (self->cpu_type == GUM_CPU_ARM64)
     {
       state->ts_64.__pc = state->ts_64.__lr;
@@ -2472,10 +2479,10 @@ frida_spawn_instance_handle_breakpoint (FridaSpawnInstance * self, FridaBreakpoi
       state->ts_32.__pc = state->ts_32.__lr;
       state->ts_32.__r[0] = self->fake_error_buf;
     }
+#endif
 
     return TRUE;
   }
-#endif
 
   if (frida_spawn_instance_handle_modinit (self, state, pc))
     return TRUE;
@@ -2485,8 +2492,7 @@ frida_spawn_instance_handle_breakpoint (FridaSpawnInstance * self, FridaBreakpoi
     case FRIDA_BREAKPOINT_SET_HELPERS:
       frida_spawn_instance_call_set_helpers (self, state, self->fake_helpers);
 
-      if (self->cpu_type == GUM_CPU_ARM64)
-        frida_spawn_instance_set_nth_breakpoint (self, 2, self->ret_gadget, FRIDA_BREAKPOINT_REPEAT_ALWAYS);
+      frida_spawn_instance_set_nth_breakpoint (self, 2, self->ret_gadget, FRIDA_BREAKPOINT_REPEAT_ALWAYS);
 
       self->breakpoint_phase = FRIDA_BREAKPOINT_DLOPEN_LIBC;
 
@@ -2799,7 +2805,7 @@ frida_spawn_instance_create_dyld_data (FridaSpawnInstance * self)
       /* releaseGlobalDyldLock */
       helpers32[2] = (guint32) self->ret_gadget;
       /* getThreadBufferFor_dlerror (unused) */
-      helpers32[3] = 0;
+      helpers32[3] = (guint32) self->ret_gadget;
 
       break;
     }
@@ -2814,12 +2820,9 @@ frida_spawn_instance_create_dyld_data (FridaSpawnInstance * self)
       /* acquireGlobalDyldLock (unused) */
       helpers64[1] = 0;
       /* releaseGlobalDyldLock */
-      helpers64[2] = (guint64) self->ret_gadget;
+      helpers64[2] = self->ret_gadget;
       /* getThreadBufferFor_dlerror (unused) */
-      if (self->cpu_type == GUM_CPU_ARM64)
-        helpers64[3] = (guint64) self->ret_gadget;
-      else
-        helpers64[3] = 0;
+      helpers64[3] = self->ret_gadget;
 
       break;
     }
